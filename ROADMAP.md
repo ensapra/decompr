@@ -44,6 +44,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Polish matched code (still matching) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Real names for the game's symbols (`rename_symbol`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | dtk and ds-decomp projects |
 | Save and restore (`progress/`, Open a saved project) | ✓ | ✓ | ✓ | the project's git; best attempts saved | the project's git; best attempts saved | the project's git; best attempts saved | the project's git; best attempts saved |
+| Saved README preserves notes, with completion bar and function map | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Reimport: a new split, matched work kept (Settings) | ✓ | ✓ | ✓ | — | — | — | — |
 | Rebuildable export | ✓ | ✓ | ✓ | the project | — | the project | the project |
 | Progress bars for foreground jobs | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -64,6 +65,9 @@ Where to start on a gap:
 
 ## Recently done
 
+- **Saved guides keep your notes.** Saving creates a basic README only when one is missing. Later saves update
+  counts and visuals inside hidden comment pairs, preserving the rest of the guide. A local SVG progress card
+  shows completion, platform and a function map in ROM and project mode; it contains no game code.
 - **The compiler of each object file, from a PS2 game's symbols.** Games linked by CodeWarrior's linker are often
   GCC's code with CodeWarrior's C library: the three with symbols had GCC's mark on 91-93% of their object files.
   The one that built most of the code is the game's, and SN's GCC is told from Sony's by its own code; the others'
@@ -342,10 +346,6 @@ Before building it, find out:
   IP, so only tunnelled rooms could be listed; room names need limits, and a host or the directory can delist one.
 
 The answer goes here: build it, build part of it, or not, and why.
-
-### A shareable progress card
-
-An image with % matched, functions and platform, for READMEs and posts. No game code in it.
 
 ## Later
 
