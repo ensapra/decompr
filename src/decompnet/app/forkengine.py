@@ -68,6 +68,28 @@ def _strip_comments(code: str) -> str:
     return _REGVAR.sub(" ", re.sub(r"//[^\n]*|/\*.*?\*/", " ", code, flags=re.S))
 
 
+def _rewrite(path: Path, text: str) -> None:
+    """`path.write_text(text, encoding="utf-8")`, the same bytes, writing only from the first 4 KB block that differs.
+    A compile writes the agent's version of a unit's source and an undo writes the original back: a dtk unit can be
+    a megabyte, and only the part from the changed function on is new. An unchanged file is only touched, so a build
+    still sees it as new."""
+    data = text.replace("\n", os.linesep).encode("utf-8")  # as text mode writes it
+    try:
+        with open(path, "r+b") as f:
+            old = f.read()
+            if old == data:
+                os.utime(path)
+                return
+            at = 0
+            while old[at:at + 4096] == data[at:at + 4096]:
+                at += 4096
+            f.seek(at)
+            f.write(data[at:])
+            f.truncate()
+    except FileNotFoundError:
+        path.write_bytes(data)
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "fork"
 
@@ -415,6 +437,7 @@ class ForkEngine:
         self._scores: dict[tuple[int, str], tuple[str, int | None, dict]] = {}
         self._index: dict[int, dict] = {}  # project id -> {unit: {"mtime", "order", "ops"}}
         self._indexing: set[int] = set()
+        self._index_dirty: set[int] = set()  # projects whose index has entries index.json doesn't have yet
         self._ilock = threading.Lock()
         self._linking: dict[str, dict] = {}  # slug -> background link run
         self._preflight_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
@@ -898,8 +921,12 @@ class ForkEngine:
                     # matches doesn't: the queue and briefs would say it's done
                     if status != "matched" and old["best_source"] and old["best_score"] and old["status"] != "matched":
                         score = old["best_score"] if score is None else min(score, old["best_score"])
-                    db.execute("UPDATE functions SET size=?, n_insns=?, status=?, best_score=?, meta=? WHERE id=?",
-                               (size, n, status, score, json.dumps(meta), old["id"]))
+                    # only what changed: SQLite writes a row's pages even when its values are the same, and a
+                    # GameCube game's 34,000 functions rewritten on every sync were most of what the app wrote
+                    if (old["size"], old["n_insns"], old["status"], old["best_score"], self._meta(old)) != \
+                            (size, n, status, score, meta):
+                        db.execute("UPDATE functions SET size=?, n_insns=?, status=?, best_score=?, meta=? WHERE id=?",
+                                   (size, n, status, score, json.dumps(meta), old["id"]))
                     if old["status"] == "matched" and status != "matched":
                         self._reopened(db, proj, old, "full report" + (", the unit doesn't build" if uname in broken
                                                                          else ""), fuzzy,
@@ -1610,12 +1637,18 @@ class ForkEngine:
         return self._index[proj["id"]]
 
     def _save_index(self, proj, fp: ForkProject) -> None:
+        """Write index.json, only when something new was indexed: every sync (each pull from a room, each edit)
+        ends an indexing pass, and a GameCube game's 11 MB index rewritten five times a second wrote 50 MB/s."""
         with self._ilock:
+            if proj["id"] not in self._index_dirty:
+                return
+            self._index_dirty.discard(proj["id"])
             snapshot = dict(self._index.get(proj["id"], {}))
         try:
             (fp.root / STATE / "index.json").write_text(json.dumps(snapshot), encoding="utf-8")
         except OSError:
-            pass
+            with self._ilock:
+                self._index_dirty.add(proj["id"])
 
     def _remember(self, proj, fp: ForkProject, unit, d) -> None:
         if unit.target is None or not unit.target.exists():
@@ -1623,7 +1656,10 @@ class ForkEngine:
         entry = {"mtime": unit.target.stat().st_mtime, "order": d.order, "ops": d.ops}
         idx = self._index_of(proj, fp)
         with self._ilock:
+            if idx.get(unit.name) == entry:  # every compile measures its unit again: mostly nothing new
+                return
             idx[unit.name] = entry
+            self._index_dirty.add(proj["id"])
 
     def _unit_index(self, proj, fp: ForkProject, unit, save: bool = True) -> dict | None:
         """Target order and mnemonics of a unit's functions, from its target object only (never races a build)."""
@@ -2019,7 +2055,7 @@ class ForkEngine:
                     self._reopened(db, proj, r, via, pct, held=pct is not None and pct >= 100)
                 elif pct is not None and r["best_score"] == 0:  # reopened before this was fixed: still says identical
                     db.execute("UPDATE functions SET best_score=? WHERE id=?", (scaled(pct, r["n_insns"]), r["id"]))
-                elif pct is not None and not r["best_source"]:
+                elif pct is not None and not r["best_source"] and r["best_score"] != scaled(pct, r["n_insns"]):
                     db.execute("UPDATE functions SET best_score=? WHERE id=?", (scaled(pct, r["n_insns"]), r["id"]))
 
     def _matched(self, db, proj, r, agent: Agent | None, text: str | None) -> None:
@@ -2397,7 +2433,7 @@ class ForkEngine:
             key = self.net.compile_key(fn, unit.name, after)
             if agents_try and (again := self.net.repeat_of(key, agent, fn)) is not None:
                 return again
-            path.write_text(after, encoding="utf-8")
+            _rewrite(path, after)
 
             def remembered(text: str, score: int | None, kept: bool = True) -> str:
                 """A result as repeat_of gives it back later (agents' tries only), plus the note when this variant
@@ -2409,7 +2445,7 @@ class ForkEngine:
                 return text + self.net.same_score_note(fn["id"], agent.id, score, code)
 
             def undo() -> None:
-                path.write_text(before, encoding="utf-8")
+                _rewrite(path, before)
                 if self._build_unit(proj, fp, unit)[0] and scores is not None:
                     self._keep_scores(proj, unit, before, scores)
 
@@ -2418,7 +2454,7 @@ class ForkEngine:
                 # the build itself is broken, not the agent's code: nothing recorded or counted, and the project
                 # is set up again in the background (one project spent five compiles on a build.ninja whose python
                 # was in another home, then the sessions quit)
-                path.write_text(before, encoding="utf-8")
+                _rewrite(path, before)
                 threading.Thread(target=self.preflight, args=(slug,), daemon=True, name=f"preflight-{slug}").start()
                 return {"text": f"❌ The project's build is broken, not your code: {broken}. Your change was undone, "
                                 "and nothing was recorded or counted. decompdecomp is setting the project up again; "
@@ -2962,11 +2998,11 @@ class ForkEngine:
             existed, text, updated = self._edited(p, rel, old, new)
             bases = {u.name: self._baseline(proj, fp, u, text) for u in units}
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(updated, encoding="utf-8")
+            _rewrite(p, updated)
 
             def undo() -> None:
                 if existed:
-                    p.write_text(text, encoding="utf-8")
+                    _rewrite(p, text)
                 else:
                     p.unlink(missing_ok=True)
                 for u in units:
@@ -3027,11 +3063,11 @@ class ForkEngine:
             protected = {(r["unit"], self._meta(r).get("symbol")) for r in self.net.store.all(
                 "SELECT unit, meta FROM functions WHERE project_id=? AND status='matched'", proj["id"])}
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(updated, encoding="utf-8")
+            _rewrite(p, updated)
 
             def undo() -> None:
                 if existed:
-                    p.write_text(text, encoding="utf-8")
+                    _rewrite(p, text)
                 else:
                     p.unlink(missing_ok=True)
                 self._build_all(proj, fp)
@@ -3065,7 +3101,7 @@ class ForkEngine:
                 if truly:
                     return f"❌ REJECTED and undone: the edit breaks {len(truly)} matched function(s): {', '.join(truly[:10])}"
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(updated, encoding="utf-8")
+                _rewrite(p, updated)
                 self._build_all(proj, fp)
             self._scores = {k: v for k, v in self._scores.items() if k[0] != proj["id"]}
             self._commit(proj, fp, rel, f"{message.strip()}\n\nEdited by {agent.name} with decompdecomp.")
